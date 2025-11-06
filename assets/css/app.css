@@ -92,11 +92,11 @@ a:hover{color:var(--accent-2)}
 /* ------------------------- 3) LAYOUT & HEADER ------------------------- */
 .container{
   width:100%;
-  max-width:1780px; /* wider desktop */
-  padding:0 var(--s4) var(--s7);
-  margin:12px auto;
+  max-width:1280px;
+  padding:0 var(--s3) var(--s5);
+  margin:8px auto;
 }
-@media (min-width:1280px){ .container{ padding-left:var(--s6); padding-right:var(--s6); } }
+@media (min-width:1280px){ .container{ padding-left:var(--s5); padding-right:var(--s5); } }
 
 header{width:100%}
 .topbar{
@@ -128,7 +128,7 @@ header{width:100%}
 .navbar__inner{
   position:relative;
   display:flex; align-items:center; gap:.75rem;
-  padding:.7rem 1rem;
+  padding:.6rem .85rem;
 }
 
 .brand{

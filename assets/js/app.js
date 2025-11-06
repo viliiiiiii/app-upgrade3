@@ -131,6 +131,20 @@ function initNav() {
   syncAria();
 }
 
+function initServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  const register = () => {
+    navigator.serviceWorker
+      .register('/sw.js', { scope: '/' })
+      .catch((err) => console.warn('Service worker registration failed', err));
+  };
+  if (document.readyState === 'complete') {
+    register();
+  } else {
+    window.addEventListener('load', register, { once: true });
+  }
+}
+
 async function fetchRoomsForBuilding(buildingId) {
   const key = String(buildingId || '');
   if (!key || key === '0') return [];
@@ -619,4 +633,5 @@ onReady(() => {
   initNotifications();
   initRooms();
   initCommandPalette();
+  initServiceWorker();
 });

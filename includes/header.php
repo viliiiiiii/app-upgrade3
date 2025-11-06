@@ -1,5 +1,6 @@
 <?php
 if (!isset($title)) { $title = APP_TITLE; }
+if (!isset($pageScripts)) { $pageScripts = []; }
 $roleKey = current_user_role_key();
 $me = current_user();
 $path = parse_url($_SERVER['REQUEST_URI'] ?? '/', PHP_URL_PATH);
@@ -101,8 +102,13 @@ $breadcrumbs = build_breadcrumbs($path);
   <title><?php echo bc_s($title); ?> - <?php echo bc_s(APP_TITLE); ?></title>
   <link rel="stylesheet" href="/assets/css/app.css?v=pro-1.1">
   <link rel="icon" href="/assets/favicon.ico">
+  <link rel="manifest" href="/manifest.webmanifest">
   <meta name="theme-color" content="#f6f9ff">
+  <meta name="csrf-token" content="<?php echo csrf_token(); ?>">
   <script type="module" src="/assets/js/app.js?v=pro-1.1" defer></script>
+  <?php foreach ($pageScripts as $script): ?>
+    <script type="module" src="<?php echo bc_s($script); ?>" defer></script>
+  <?php endforeach; ?>
   <style>
     /* Lightweight breadcrumb styling (move to app.css later if you want) */
     .breadcrumbs { margin: 10px 0 14px; font-size: 13px; color: #475569; }
