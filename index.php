@@ -1,17 +1,28 @@
 <?php
+use App\Domain\DashboardService;
+use App\Domain\TaskRepository;
+
 require_once __DIR__ . '/helpers.php';
+
 require_login();
 
-$counts = analytics_counts();
+$dashboardService = new DashboardService(new TaskRepository());
+$overview = $dashboardService->overview();
 
-$priorityData = analytics_group("SELECT priority, COUNT(*) AS total FROM tasks GROUP BY priority");
-$statusData   = analytics_group("SELECT status, COUNT(*) AS total FROM tasks GROUP BY status");
-$assigneeData = analytics_group("SELECT COALESCE(NULLIF(TRIM(assigned_to), ''), 'Unassigned') AS label, COUNT(*) AS total
-  FROM tasks GROUP BY label ORDER BY total DESC LIMIT 10");
-$ageData = analytics_group("SELECT " . get_age_bucket_sql() . " AS bucket, COUNT(*) AS total FROM tasks t WHERE t.status <> 'done' GROUP BY bucket");
-$buildingData = analytics_group("SELECT b.name AS label, COUNT(*) AS total FROM tasks t JOIN buildings b ON b.id = t.building_id GROUP BY b.id ORDER BY total DESC LIMIT 10");
-$roomData = analytics_group("SELECT CONCAT(r.room_number, IF(r.label IS NULL OR r.label = '', '', CONCAT(' - ', r.label))) AS label,
-  COUNT(*) AS total FROM tasks t JOIN rooms r ON r.id = t.room_id GROUP BY r.id ORDER BY total DESC LIMIT 10");
+$counts        = $overview['counts'];
+$priorityData  = $overview['priority'];
+$statusData    = $overview['status'];
+$assigneeData  = $overview['assignees'];
+$buildingData  = $overview['buildings'];
+$roomData      = $overview['rooms'];
+$ageData       = $overview['age'];
+$recentTasks   = $overview['recent'];
+
+$buildingsList = fetch_buildings();
+$priorityOptions = array_values(array_filter(get_priorities(), fn ($p) => $p !== ''));
+$statusOptions   = get_statuses();
+
+$pageScripts = ['/assets/js/dashboard.js?v=pro-1.1'];
 
 $title = 'Dashboard';
 include __DIR__ . '/includes/header.php';
@@ -62,6 +73,52 @@ include __DIR__ . '/includes/header.php';
   background:var(--ui-card); border:1px solid var(--ui-line); border-radius:16px;
   padding:1rem; box-shadow: 0 1px 0 rgba(16,24,40,.04), 0 8px 20px rgba(2,6,23,.04);
 }
+.card--compact{ padding:1rem; }
+.quick-grid{ display:grid; gap:1rem; margin:1rem 0; }
+@media (min-width:900px){ .quick-grid{ grid-template-columns: minmax(0,1fr) minmax(0,1fr); } }
+.quick-card, .recent-card{ background:var(--ui-card); border:1px solid var(--ui-line); border-radius:16px; box-shadow:0 1px 0 rgba(16,24,40,.04), 0 12px 28px rgba(15,23,42,.08); }
+.quick-card h2, .recent-card h2{ font-size:1.05rem; margin:0; color:var(--ui-text); }
+.quick-subtitle{ font-size:.82rem; color:var(--ui-muted); margin-top:.25rem; }
+.quick-form{ display:grid; gap:.75rem; margin-top:1rem; }
+@media (min-width:720px){ .quick-form{ grid-template-columns: repeat(2,minmax(0,1fr)); } }
+@media (min-width:1120px){ .quick-form{ grid-template-columns: repeat(3,minmax(0,1fr)); } }
+.quick-field{ display:flex; flex-direction:column; gap:.35rem; }
+.quick-field--full{ grid-column:1/-1; }
+.quick-field label{ font-size:.78rem; font-weight:600; color:var(--ui-muted); text-transform:uppercase; letter-spacing:.08em; }
+.quick-field input,
+.quick-field select{
+  appearance:none;
+  border-radius:12px;
+  border:1px solid var(--ui-line);
+  padding:.55rem .75rem;
+  font-size:.9rem;
+  background:#fff;
+  transition:border-color .16s ease, box-shadow .16s ease;
+}
+.quick-field input:focus,
+.quick-field select:focus{ outline:none; border-color:var(--ui-primary); box-shadow:0 0 0 3px rgba(51,93,255,.12); }
+.quick-actions__footer{ grid-column:1/-1; display:flex; align-items:center; gap:.75rem; margin-top:.25rem; }
+.quick-feedback{ font-size:.78rem; color:var(--ui-muted); margin:0; }
+.quick-feedback.is-error{ color:var(--err); }
+.quick-feedback.is-success{ color:var(--ok); }
+.recent-head{ display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-bottom:.75rem; }
+.recent-list{ list-style:none; margin:0; padding:0; display:flex; flex-direction:column; gap:.75rem; }
+.recent-item{ border:1px solid var(--ui-line); border-radius:14px; padding:.75rem .9rem; background:#fff; box-shadow:0 8px 22px rgba(15,23,42,.06); }
+.recent-row{ display:flex; align-items:center; justify-content:space-between; gap:1rem; flex-wrap:wrap; }
+.recent-title{ font-weight:700; color:var(--ui-text); text-decoration:none; font-size:.95rem; }
+.recent-title:hover{ color:var(--ui-primary); }
+.recent-pills{ display:flex; gap:.5rem; flex-wrap:wrap; }
+.recent-pill{ display:inline-flex; align-items:center; gap:.35rem; font-size:.75rem; padding:.2rem .55rem; border-radius:999px; text-transform:uppercase; letter-spacing:.08em; font-weight:600; }
+.recent-pill--status-open{ background:var(--info-bg); color:var(--info); }
+.recent-pill--status-in_progress{ background:#fef9c3; color:#a16207; }
+.recent-pill--status-done{ background:var(--ok-bg); color:var(--ok); }
+.recent-pill--priority{ background:var(--ui-primary-10); color:var(--ui-primary); }
+.recent-meta{ margin-top:.6rem; font-size:.78rem; color:var(--ui-muted); display:flex; flex-wrap:wrap; gap:.75rem; }
+.recent-action{ margin-top:.75rem; background:var(--ui-primary); color:#fff; border:none; border-radius:10px; padding:.45rem .85rem; font-size:.82rem; font-weight:600; cursor:pointer; transition:transform .16s ease, box-shadow .16s ease; }
+.recent-action[disabled]{ opacity:.65; cursor:default; }
+.recent-action:not([disabled]):hover{ transform:translateY(-1px); box-shadow:0 12px 26px rgba(51,93,255,.18); }
+.recent-empty{ padding:1rem; border:1px dashed var(--ui-line); border-radius:12px; color:var(--ui-muted); font-size:.85rem; text-align:center; }
+.recent-list.is-loading{ opacity:.6; }
 .chart-head{ display:flex; align-items:center; justify-content:space-between; gap:.75rem; margin-bottom:.5rem; }
 .chart-head h2{ font-size:1rem; font-weight:800; color:var(--ui-text); }
 .chart-legend{ display:flex; flex-wrap:wrap; gap:.4rem; }
@@ -118,6 +175,102 @@ section.card{ background:var(--ui-grad); }
     </a>
   </div>
 </section>
+
+<div class="quick-grid">
+  <section class="card card--compact quick-card">
+    <div>
+      <h2>Quick Task</h2>
+      <p class="quick-subtitle">Log a task without leaving the dashboard.</p>
+    </div>
+    <form id="quickTaskForm" class="quick-form" novalidate>
+      <div class="quick-field quick-field--full">
+        <label for="quick-title">Title</label>
+        <input type="text" id="quick-title" name="title" placeholder="Touch-up paint in lobby" required>
+      </div>
+      <div class="quick-field">
+        <label for="quick-building">Building</label>
+        <select id="quick-building" name="building_id" required data-room-source data-room-target="quick-room">
+          <option value="">Select building</option>
+          <?php foreach ($buildingsList as $building): ?>
+            <option value="<?php echo (int)$building['id']; ?>"><?php echo sanitize($building['name']); ?></option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+      <div class="quick-field">
+        <label for="quick-room">Room</label>
+        <select id="quick-room" name="room_id" required>
+          <option value="">Select room</option>
+        </select>
+      </div>
+      <div class="quick-field">
+        <label for="quick-priority">Priority</label>
+        <select id="quick-priority" name="priority">
+          <option value="">Default</option>
+          <?php foreach ($priorityOptions as $priority): ?>
+            <option value="<?php echo sanitize($priority); ?>"><?php echo strtoupper($priority); ?></option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+      <div class="quick-field">
+        <label for="quick-status">Status</label>
+        <select id="quick-status" name="status">
+          <?php foreach ($statusOptions as $status): ?>
+            <option value="<?php echo sanitize($status); ?>" <?php echo $status === 'open' ? 'selected' : ''; ?>><?php echo ucwords(str_replace('_', ' ', $status)); ?></option>
+          <?php endforeach; ?>
+        </select>
+      </div>
+      <div class="quick-field">
+        <label for="quick-due">Due date</label>
+        <input type="date" id="quick-due" name="due_date">
+      </div>
+      <div class="quick-field">
+        <label for="quick-assigned">Assignee</label>
+        <input type="text" id="quick-assigned" name="assigned_to" placeholder="Optional assignee">
+      </div>
+      <div class="quick-actions__footer">
+        <button type="submit" class="btn primary small" data-quick-submit>Create Task</button>
+        <p class="quick-feedback" data-quick-feedback></p>
+      </div>
+    </form>
+  </section>
+
+  <section class="card card--compact recent-card">
+    <div class="recent-head">
+      <div>
+        <h2>Recently Updated</h2>
+        <p class="quick-subtitle">Latest six updates across the portfolio.</p>
+      </div>
+      <button class="btn secondary small" data-refresh-recent type="button">Refresh</button>
+    </div>
+    <ul class="recent-list" data-recent-list>
+      <?php if (empty($recentTasks)): ?>
+        <li class="recent-empty">No recent updates yet.</li>
+      <?php else: ?>
+        <?php foreach ($recentTasks as $task): ?>
+          <li class="recent-item" data-task-id="<?php echo (int)$task['id']; ?>">
+            <div class="recent-row">
+              <a class="recent-title" href="/task_view.php?id=<?php echo (int)$task['id']; ?>"><?php echo sanitize($task['title']); ?></a>
+              <div class="recent-pills">
+                <span class="recent-pill recent-pill--status-<?php echo sanitize($task['status']); ?>"><?php echo ucwords(str_replace('_', ' ', $task['status'])); ?></span>
+                <?php if (!empty($task['priority'])): ?>
+                  <span class="recent-pill recent-pill--priority"><?php echo strtoupper(sanitize($task['priority'])); ?></span>
+                <?php endif; ?>
+              </div>
+            </div>
+            <?php $updatedAt = $task['updated_at'] ?? $task['created_at'] ?? null; ?>
+            <div class="recent-meta">
+              <span><?php echo sanitize($task['building_name'] ?? ''); ?></span>
+              <span><?php echo sanitize($task['room_label'] ?? ''); ?></span>
+              <span><?php echo $task['due_date'] ? 'Due ' . sanitize($task['due_date']) : 'No due date'; ?></span>
+              <span>Updated <?php echo $updatedAt ? sanitize(date('M j, Y g:ia', strtotime($updatedAt))) : 'Unknown'; ?></span>
+            </div>
+            <button class="recent-action" type="button" data-action="complete-task" data-task-id="<?php echo (int)$task['id']; ?>" <?php echo $task['status'] === 'done' ? 'disabled' : ''; ?>><?php echo $task['status'] === 'done' ? 'Done' : 'Mark done'; ?></button>
+          </li>
+        <?php endforeach; ?>
+      <?php endif; ?>
+    </ul>
+  </section>
+</div>
 
 <div class="chart-grid">
   <section class="chart-card">

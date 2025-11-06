@@ -541,12 +541,19 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
     }
 
     function analytics_counts(): array {
-        $pdo = get_pdo();
-        $open    = $pdo->query("SELECT COUNT(*) FROM tasks WHERE status='open'")->fetchColumn();
-        $done30  = $pdo->query("SELECT COUNT(*) FROM tasks WHERE status='done' AND updated_at >= (CURDATE() - INTERVAL 30 DAY)")->fetchColumn();
-        $dueWeek = $pdo->query("SELECT COUNT(*) FROM tasks WHERE status <> 'done' AND due_date BETWEEN CURDATE() AND (CURDATE() + INTERVAL 7 DAY)")->fetchColumn();
-        $overdue = $pdo->query("SELECT COUNT(*) FROM tasks WHERE status <> 'done' AND due_date IS NOT NULL AND due_date < CURDATE()")->fetchColumn();
-        return ['open'=>(int)$open,'done30'=>(int)$done30,'dueWeek'=>(int)$dueWeek,'overdue'=>(int)$overdue];
+        $sql = "SELECT
+            SUM(CASE WHEN status = 'open' THEN 1 ELSE 0 END) AS open,
+            SUM(CASE WHEN status = 'done' AND updated_at >= (CURRENT_DATE - INTERVAL 30 DAY) THEN 1 ELSE 0 END) AS done30,
+            SUM(CASE WHEN status <> 'done' AND due_date BETWEEN CURRENT_DATE AND (CURRENT_DATE + INTERVAL 7 DAY) THEN 1 ELSE 0 END) AS dueWeek,
+            SUM(CASE WHEN status <> 'done' AND due_date IS NOT NULL AND due_date < CURRENT_DATE THEN 1 ELSE 0 END) AS overdue
+        FROM tasks";
+        $row = get_pdo()->query($sql)->fetch(PDO::FETCH_ASSOC) ?: [];
+        return [
+            'open'    => (int)($row['open'] ?? 0),
+            'done30'  => (int)($row['done30'] ?? 0),
+            'dueWeek' => (int)($row['dueWeek'] ?? 0),
+            'overdue' => (int)($row['overdue'] ?? 0),
+        ];
     }
 
     function analytics_group(string $sql): array {
