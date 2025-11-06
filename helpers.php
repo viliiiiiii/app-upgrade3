@@ -5,10 +5,32 @@ require_once __DIR__ . '/config.php';
 
 date_default_timezone_set(APP_TIMEZONE);
 
+$forceHttps = defined('APP_FORCE_HTTPS') && APP_FORCE_HTTPS;
+$isHttps = $forceHttps || (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off');
+
+if (PHP_SAPI !== 'cli') {
+    @ini_set('session.cookie_httponly', '1');
+    @ini_set('session.cookie_secure', $isHttps ? '1' : '0');
+    @ini_set('session.cookie_samesite', 'Strict');
+}
+
 // Ensure session started
 if (session_status() === PHP_SESSION_NONE) {
+    $cookieParams = session_get_cookie_params();
+    session_set_cookie_params([
+        'lifetime' => $cookieParams['lifetime'] ?? 0,
+        'path'     => $cookieParams['path'] ?? '/',
+        'domain'   => $cookieParams['domain'] ?? '',
+        'secure'   => $isHttps,
+        'httponly' => true,
+        'samesite' => 'Strict',
+    ]);
     session_name(SESSION_NAME);
     session_start();
+    if (!isset($_SESSION['__session_init'])) {
+        session_regenerate_id(true);
+        $_SESSION['__session_init'] = time();
+    }
 }
 
 // Composer autoload if present
@@ -20,6 +42,35 @@ if (file_exists($autoloadPath)) {
 // Guard: only define functions once even if file is included multiple times.
 if (!defined('HELPERS_BOOTSTRAPPED')) {
     define('HELPERS_BOOTSTRAPPED', true);
+
+    function app_send_security_headers(): void {
+        static $sent = false;
+        if ($sent || headers_sent() || PHP_SAPI === 'cli') {
+            return;
+        }
+
+        header('X-Frame-Options: SAMEORIGIN');
+        header('X-Content-Type-Options: nosniff');
+        header('Referrer-Policy: strict-origin-when-cross-origin');
+        header('Permissions-Policy: geolocation=(), camera=(), microphone=(), payment=()');
+        header('Cross-Origin-Opener-Policy: same-origin');
+        header('Cross-Origin-Resource-Policy: same-origin');
+
+        if (defined('APP_CONTENT_SECURITY_POLICY') && APP_CONTENT_SECURITY_POLICY !== '') {
+            header('Content-Security-Policy: ' . APP_CONTENT_SECURITY_POLICY);
+        }
+
+        $https = (defined('APP_FORCE_HTTPS') && APP_FORCE_HTTPS)
+            || (!empty($_SERVER['HTTPS']) && strtolower((string)$_SERVER['HTTPS']) !== 'off');
+        if ($https) {
+            $maxAge = defined('APP_HSTS_MAX_AGE') ? (int)APP_HSTS_MAX_AGE : 31536000;
+            header('Strict-Transport-Security: max-age=' . $maxAge . '; includeSubDomains');
+        }
+
+        $sent = true;
+    }
+
+    app_send_security_headers();
 
     /**
      * Return a PDO connection to either the application DB ("apps" = punchlist)
@@ -84,6 +135,95 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
     }
     if (!defined('NOTIF_DB_KEY')) define('NOTIF_DB_KEY','core');
 
+    function permission_catalog(): array {
+        static $catalog = null;
+        if ($catalog !== null) {
+            return $catalog;
+        }
+
+        $catalog = [
+            'view'                 => ['label' => 'View data',                'description' => 'Read-only access to dashboards, tasks, rooms, and inventory.'],
+            'download'             => ['label' => 'Download exports',         'description' => 'Export CSV, PDF, QR codes, and reports.'],
+            'edit'                 => ['label' => 'Edit shared data',         'description' => 'Create and edit tasks, notes, and shared resources.'],
+            'inventory_manage'     => ['label' => 'Manage inventory',         'description' => 'Create items, adjust quantities, and record movements.'],
+            'inventory_transfers'  => ['label' => 'Inventory transfer paperwork', 'description' => 'Upload and sign transfer forms and attachments.'],
+            'manage_users'         => ['label' => 'Manage users',             'description' => 'Create, update, suspend, and assign permissions to users.'],
+            'manage_sectors'       => ['label' => 'Manage sectors',           'description' => 'Create sectors, update contact info, and assign leads.'],
+            'manage_rooms'         => ['label' => 'Manage rooms',             'description' => 'Maintain building/room directory and metadata.'],
+            'notifications_admin'  => ['label' => 'Notifications admin',      'description' => 'Adjust notification defaults and deliverability.'],
+        ];
+
+        return $catalog;
+    }
+
+    function role_permissions_for(string $roleKey, bool $forceRefresh = false): array {
+        static $cache = [];
+        if ($forceRefresh) {
+            unset($cache[$roleKey]);
+        }
+        if (isset($cache[$roleKey])) {
+            return $cache[$roleKey];
+        }
+
+        $defaults = [
+            'viewer' => ['view', 'download'],
+            'admin'  => ['view', 'download', 'edit', 'inventory_manage', 'manage_rooms', 'inventory_transfers'],
+        ];
+
+        try {
+            $pdo = get_pdo('core');
+            $stmt = $pdo->prepare('SELECT rp.permission_key
+                                     FROM role_permissions rp
+                                     JOIN roles r ON r.id = rp.role_id
+                                    WHERE r.key_slug = :role AND rp.granted = 1');
+            $stmt->execute([':role' => $roleKey]);
+            $perms = $stmt->fetchAll(PDO::FETCH_COLUMN) ?: [];
+            if ($perms) {
+                return $cache[$roleKey] = array_values(array_unique(array_map('strval', $perms)));
+            }
+        } catch (Throwable $e) {
+            // fall back to defaults if the new tables are not migrated yet
+        }
+
+        return $cache[$roleKey] = $defaults[$roleKey] ?? [];
+    }
+
+    function user_permission_overrides_for(int $userId, bool $forceRefresh = false): array {
+        static $cache = [];
+        if ($forceRefresh) {
+            unset($cache[$userId]);
+        }
+        if (isset($cache[$userId])) {
+            return $cache[$userId];
+        }
+
+        $cache[$userId] = [];
+        try {
+            $pdo = get_pdo('core');
+            $stmt = $pdo->prepare('SELECT permission_key, granted FROM user_permissions WHERE user_id = :id');
+            $stmt->execute([':id' => $userId]);
+            foreach ($stmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+                $perm = (string)($row['permission_key'] ?? '');
+                if ($perm === '') {
+                    continue;
+                }
+                $cache[$userId][$perm] = !empty($row['granted']);
+            }
+        } catch (Throwable $e) {
+            $cache[$userId] = [];
+        }
+
+        return $cache[$userId];
+    }
+
+    function permission_invalidate_role_cache(string $roleKey): void {
+        role_permissions_for($roleKey, true);
+    }
+
+    function permission_invalidate_user_cache(int $userId): void {
+        user_permission_overrides_for($userId, true);
+    }
+
     /* ===== Security: CSRF, flash, redirects ===== */
 
     function csrf_token(): string {
@@ -126,6 +266,7 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
             session_name(SESSION_NAME);
             session_start();
         }
+        session_regenerate_id(true);
         // Use a dedicated key; keep old 'user' for backward compat but clear it to avoid stale records
         $_SESSION['uid'] = (int)$userId;
         unset($_SESSION['user']); // clear legacy session payload if present
@@ -233,7 +374,7 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
 
     function fetch_rooms_by_building(?int $buildingId): array {
         if (!$buildingId) return [];
-        $stmt = get_pdo()->prepare('SELECT id,room_number,label FROM rooms WHERE building_id=? ORDER BY room_number');
+        $stmt = get_pdo()->prepare('SELECT id, room_number, label, sector_id, floor_label, capacity, notes FROM rooms WHERE building_id=? ORDER BY room_number');
         $stmt->execute([$buildingId]);
         return $stmt->fetchAll();
     }
@@ -287,6 +428,144 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
         $host = $parts['scheme'].'://'.S3_BUCKET.'.'.$parts['host'];
         $path = $parts['path'] ?? '';
         return rtrim($host.$path,'/').'/'.ltrim($key,'/');
+    }
+
+    function absolute_url(string $path): string {
+        $trimmed = trim($path);
+        if ($trimmed === '') {
+            return defined('BASE_URL') ? rtrim((string)BASE_URL, '/') . '/' : '/';
+        }
+        if (preg_match('#^https?://#i', $trimmed)) {
+            return $trimmed;
+        }
+        $base = defined('BASE_URL') ? rtrim((string)BASE_URL, '/') : '';
+        if ($base === '') {
+            return '/' . ltrim($trimmed, '/');
+        }
+        return $base . '/' . ltrim($trimmed, '/');
+    }
+
+    function send_email(array $message): bool {
+        $to = trim((string)($message['to'] ?? ''));
+        if (!filter_var($to, FILTER_VALIDATE_EMAIL)) {
+            return false;
+        }
+
+        $subject = trim((string)($message['subject'] ?? ''));
+        $html    = (string)($message['html'] ?? '');
+        $text    = (string)($message['text'] ?? '');
+
+        if ($html === '' && $text === '') {
+            $text = 'Notification';
+        }
+        if ($text === '') {
+            $text = trim(strip_tags($html));
+        }
+        if ($html === '') {
+            $html = nl2br(htmlspecialchars($text, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8'));
+        }
+
+        $fromAddress = defined('MAIL_FROM_ADDRESS') ? trim((string)MAIL_FROM_ADDRESS) : '';
+        if (!filter_var($fromAddress, FILTER_VALIDATE_EMAIL)) {
+            return false;
+        }
+        $fromName    = defined('MAIL_FROM_NAME') ? trim((string)MAIL_FROM_NAME) : '';
+        $returnPath  = defined('MAIL_RETURN_PATH') ? trim((string)MAIL_RETURN_PATH) : '';
+        $transport   = defined('MAIL_TRANSPORT') ? strtolower((string)MAIL_TRANSPORT) : 'mail';
+
+        if ($transport === 'ses') {
+            $sesKey    = defined('MAIL_SES_KEY') ? trim((string)MAIL_SES_KEY) : '';
+            $sesSecret = defined('MAIL_SES_SECRET') ? trim((string)MAIL_SES_SECRET) : '';
+
+            if ($sesKey === '' || $sesSecret === '') {
+                $fallbackKey    = defined('S3_KEY') ? trim((string)S3_KEY) : '';
+                $fallbackSecret = defined('S3_SECRET') ? trim((string)S3_SECRET) : '';
+                if ($sesKey === '' && $fallbackKey !== '') {
+                    $sesKey = $fallbackKey;
+                }
+                if ($sesSecret === '' && $fallbackSecret !== '') {
+                    $sesSecret = $fallbackSecret;
+                }
+            }
+
+            if ($sesKey === '' || $sesSecret === '') {
+                try { error_log('send_email: SES transport selected but credentials missing.'); } catch (Throwable $_) {}
+                return false;
+            }
+
+            try {
+                $client = new Aws\Ses\SesClient([
+                    'version'     => '2010-12-01',
+                    'region'      => defined('MAIL_SES_REGION') ? MAIL_SES_REGION : (defined('S3_REGION') ? S3_REGION : 'us-east-1'),
+                    'credentials' => ['key' => $sesKey, 'secret' => $sesSecret],
+                ]);
+                $source = $fromName !== ''
+                    ? sprintf('%s <%s>', $fromName, $fromAddress)
+                    : $fromAddress;
+                $client->sendEmail([
+                    'Source' => $source,
+                    'Destination' => ['ToAddresses' => [$to]],
+                    'Message' => [
+                        'Subject' => ['Data' => $subject, 'Charset' => 'UTF-8'],
+                        'Body' => [
+                            'Text' => ['Data' => $text, 'Charset' => 'UTF-8'],
+                            'Html' => ['Data' => $html, 'Charset' => 'UTF-8'],
+                        ],
+                    ],
+                    'ReturnPath' => $returnPath !== '' ? $returnPath : null,
+                ]);
+                return true;
+            } catch (Throwable $e) {
+                try { error_log('SES send failed: ' . $e->getMessage()); } catch (Throwable $_) {}
+                return false;
+            }
+        }
+
+        $boundary = '=_Part_' . bin2hex(random_bytes(8));
+        $headers  = [];
+        $fromLine = $fromName !== ''
+            ? mb_encode_mimeheader($fromName, 'UTF-8') . ' <' . $fromAddress . '>'
+            : $fromAddress;
+        $headers[] = 'From: ' . $fromLine;
+        if ($returnPath !== '') {
+            $headers[] = 'Reply-To: ' . $returnPath;
+        }
+        $headers[] = 'MIME-Version: 1.0';
+        $headers[] = 'Content-Type: multipart/alternative; boundary="' . $boundary . '"';
+
+        $body  = '--' . $boundary . "\r\n";
+        $body .= "Content-Type: text/plain; charset=UTF-8\r\n\r\n" . $text . "\r\n";
+        $body .= '--' . $boundary . "\r\n";
+        $body .= "Content-Type: text/html; charset=UTF-8\r\n\r\n" . $html . "\r\n";
+        $body .= '--' . $boundary . "--";
+
+        $extraParams = '';
+        if ($returnPath !== '') {
+            $extraParams = '-f' . $returnPath;
+        }
+
+        return mail($to, $subject, $body, implode("\r\n", $headers), $extraParams);
+    }
+
+    function password_strength_error(string $password): ?string {
+        if (strlen($password) < 10) {
+            return 'Password must be at least 10 characters long.';
+        }
+        if (preg_match('/\s/', $password)) {
+            return 'Password cannot contain spaces.';
+        }
+
+        $classes = 0;
+        $classes += preg_match('/[A-Z]/', $password) ? 1 : 0;
+        $classes += preg_match('/[a-z]/', $password) ? 1 : 0;
+        $classes += preg_match('/[0-9]/', $password) ? 1 : 0;
+        $classes += preg_match('/[^a-zA-Z0-9]/', $password) ? 1 : 0;
+
+        if ($classes < 3) {
+            return 'Use a mix of uppercase, lowercase, numbers, and symbols.';
+        }
+
+        return null;
     }
 
     /* ===== Tasks (APPS DB) ===== */
@@ -762,15 +1041,28 @@ if (!defined('HELPERS_BOOTSTRAPPED')) {
     }
 
     function can(string $perm): bool {
+        $perm = (string)$perm;
+        $catalog = permission_catalog();
+        if (!isset($catalog[$perm])) {
+            return false;
+        }
+
         $role = current_user_role_key();
         if ($role === 'root') {
             return true;
         }
-        $map = [
-            'viewer' => ['view', 'download'],
-            'admin'  => ['view', 'download', 'edit', 'inventory_manage'],
-        ];
-        return in_array($perm, $map[$role] ?? [], true);
+
+        $user = current_user();
+        $userId = isset($user['id']) ? (int)$user['id'] : 0;
+        if ($userId > 0) {
+            $overrides = user_permission_overrides_for($userId);
+            if (array_key_exists($perm, $overrides)) {
+                return (bool)$overrides[$perm];
+            }
+        }
+
+        $rolePerms = role_permissions_for($role);
+        return in_array($perm, $rolePerms, true);
     }
 
     function require_perm(string $perm): void {

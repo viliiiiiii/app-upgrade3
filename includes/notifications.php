@@ -98,6 +98,56 @@ function notif_resolve_local_user_ids(array $userIds): array {
     return array_values(array_unique($out));
 }
 
+function notif_type_allows_push(int $userId, string $type): bool {
+    $pref = notif_get_type_pref($userId, $type);
+    return !empty($pref['allow_push']);
+}
+
+function notif_delivery_email(int $userId): ?string {
+    static $cache = [];
+    if (array_key_exists($userId, $cache)) {
+        return $cache[$userId];
+    }
+
+    $email = null;
+    try {
+        $core = get_pdo('core');
+        $stmt = $core->prepare('SELECT notification_email, email FROM users WHERE id = ? LIMIT 1');
+        $stmt->execute([$userId]);
+        $row = $stmt->fetch(PDO::FETCH_ASSOC);
+        if ($row) {
+            $candidates = [
+                $row['notification_email'] ?? null,
+                $row['email'] ?? null,
+            ];
+            foreach ($candidates as $candidate) {
+                if ($candidate && filter_var($candidate, FILTER_VALIDATE_EMAIL)) {
+                    $email = (string)$candidate;
+                    break;
+                }
+            }
+        }
+    } catch (Throwable $e) {
+        $email = null;
+    }
+
+    if ($email === null) {
+        try {
+            $apps = get_pdo();
+            $stmt = $apps->prepare('SELECT email FROM users WHERE id = ? LIMIT 1');
+            $stmt->execute([$userId]);
+            $row = $stmt->fetch(PDO::FETCH_ASSOC);
+            if ($row && !empty($row['email']) && filter_var($row['email'], FILTER_VALIDATE_EMAIL)) {
+                $email = (string)$row['email'];
+            }
+        } catch (Throwable $e) {
+            $email = null;
+        }
+    }
+
+    return $cache[$userId] = $email;
+}
+
 /** Upsert per-type preference (web/email/push + mute) */
 function notif_set_type_pref(int $userId, string $type, array $prefs): void {
     $pdo = notif_pdo();
@@ -180,6 +230,10 @@ function notif_emit(array $args): ?int {
     $allow_email = !empty($prefs['allow_email']);
     $allow_push  = !empty($prefs['allow_push']);
 
+    if (!$allow_web && !$allow_email && !$allow_push) {
+        return null;
+    }
+
     // Write the web notification row when allowed
     $notifId = null;
     if ($allow_web) {
@@ -200,12 +254,40 @@ function notif_emit(array $args): ?int {
         $notifId = (int)$pdo->lastInsertId();
     }
 
-    // Queue background channels (email/push) if allowed for this user+type
-    if ($notifId && ($allow_email || $allow_push)) {
-        $ins = $pdo->prepare("INSERT INTO notification_channels_queue (notification_id, channel, status, scheduled_at)
-                              VALUES (:nid, :ch, 'pending', NULL)");
-        if ($allow_email) { $ins->execute([':nid'=>$notifId, ':ch'=>'email']); }
-        if ($allow_push)  { $ins->execute([':nid'=>$notifId, ':ch'=>'push']); }
+    if ($allow_email) {
+        $email = notif_delivery_email($userId);
+        if ($email) {
+            $title = trim((string)($args['title'] ?? ''));
+            if ($title === '') {
+                $title = defined('APP_TITLE') ? 'Update from ' . APP_TITLE : 'Update';
+            }
+            $body = trim((string)($args['body'] ?? ''));
+            $link = (string)($args['url'] ?? '');
+            $absoluteLink = $link !== '' ? absolute_url($link) : '';
+            $text = $body;
+            if ($absoluteLink !== '') {
+                $text .= ($text !== '' ? "\n\n" : '') . 'Open: ' . $absoluteLink;
+            }
+            if ($text === '') {
+                $text = $title;
+            }
+            $html = '';
+            if ($body !== '') {
+                $html .= '<p>' . nl2br(htmlspecialchars($body, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8')) . '</p>';
+            }
+            if ($absoluteLink !== '') {
+                $html .= '<p><a href="' . htmlspecialchars($absoluteLink, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '">Open in ' . htmlspecialchars(APP_TITLE, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</a></p>';
+            }
+            if ($html === '') {
+                $html = '<p>' . htmlspecialchars($title, ENT_QUOTES | ENT_SUBSTITUTE, 'UTF-8') . '</p>';
+            }
+            send_email([
+                'to' => $email,
+                'subject' => $title,
+                'text' => $text,
+                'html' => $html,
+            ]);
+        }
     }
 
     return $notifId;
@@ -255,18 +337,21 @@ function notif_unread_count(int $userId): int {
 function notif_recent_unread(int $userId, int $limit = 3): array {
     $limit = max(1, (int)$limit);
     $pdo = notif_pdo();
-    $st = $pdo->prepare("SELECT id, title, body, url, created_at FROM notifications WHERE user_id = :u AND is_read = 0 ORDER BY id DESC LIMIT :lim");
+    $st = $pdo->prepare("SELECT id, title, body, url, created_at, type FROM notifications WHERE user_id = :u AND is_read = 0 ORDER BY id DESC LIMIT :lim");
     $st->bindValue(':u', $userId, PDO::PARAM_INT);
     $st->bindValue(':lim', $limit, PDO::PARAM_INT);
     $st->execute();
     $rows = $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
-    return array_map(static function ($row) {
+    return array_map(static function ($row) use ($userId) {
+        $type = (string)($row['type'] ?? '');
         return [
             'id'         => (int)($row['id'] ?? 0),
             'title'      => $row['title'] ?? '',
             'body'       => $row['body'] ?? '',
             'url'        => $row['url'] ?? null,
             'created_at' => $row['created_at'] ?? null,
+            'type'       => $type,
+            'should_push'=> $type !== '' ? notif_type_allows_push($userId, $type) : false,
         ];
     }, $rows);
 }

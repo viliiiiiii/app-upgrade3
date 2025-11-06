@@ -18,38 +18,6 @@ if (($_GET['action'] ?? '') === 'connect') {
     $userId  = (int)($me['id'] ?? 0);
     if ($userId <= 0) { http_response_code(401); exit; }
 
-    // Upsert this browser as a "web" device
-    if (!function_exists('notif_touch_web_device')) {
-        function notif_touch_web_device(int $userId, string $userAgent): void {
-            $pdo = notif_pdo();
-            $ua   = substr($userAgent, 0, 255);
-
-            $sessionId = session_id();
-            if ($sessionId === '' || $sessionId === false) {
-                $sessionId = $_COOKIE['PHPSESSID'] ?? bin2hex(random_bytes(8));
-            }
-
-            $fingerprint = implode('|', [
-                (string)$userId,
-                (string)$sessionId,
-                substr((string)($_SERVER['REMOTE_ADDR'] ?? ''), 0, 45),
-                $ua,
-            ]);
-            $endpoint = 'internal-webpush://' . sha1($fingerprint);
-
-            $sql = "INSERT INTO notification_devices (user_id, kind, endpoint, user_agent, created_at, last_used_at)"
-                 . " VALUES (:u, 'webpush', :ep, :ua, NOW(), NOW())"
-                 . " ON DUPLICATE KEY UPDATE last_used_at = NOW(), user_agent = VALUES(user_agent), endpoint = VALUES(endpoint)";
-
-            try {
-                $pdo->prepare($sql)->execute([':u' => $userId, ':ep' => $endpoint, ':ua' => $ua]);
-            } catch (Throwable $e) {
-                try {
-                    error_log('notif_touch_web_device failed: ' . $e->getMessage());
-                } catch (Throwable $_) {}
-            }
-        }
-    }
     notif_touch_web_device($userId, (string)($_SERVER['HTTP_USER_AGENT'] ?? ''));
 
     $pdo = notif_pdo();
@@ -63,20 +31,22 @@ if (($_GET['action'] ?? '') === 'connect') {
     };
 
     // Prefs check (allow_web + mute_until)
-    $shouldDeliver = function(int $userId, string $type) use ($pdo): bool {
+    $shouldDeliver = function(int $userId, string $type): bool {
         try {
-            $st = $pdo->prepare("SELECT allow_web, mute_until
-                                 FROM notification_type_prefs
-                                 WHERE user_id = :u AND type = :t LIMIT 1");
-            $st->execute([':u'=>$userId, ':t'=>$type]);
-            $row = $st->fetch(PDO::FETCH_ASSOC);
-            if (!$row) return true; // default allow
-            if (empty($row['allow_web'])) return false;
-            if (!empty($row['mute_until']) && strtotime((string)$row['mute_until']) > time()) return false;
-            return true;
+            $pref = notif_get_type_pref($userId, $type);
         } catch (Throwable $e) {
-            return true; // fail-open
+            return true;
         }
+        if (empty($pref['allow_web'])) {
+            return false;
+        }
+        if (!empty($pref['mute_until'])) {
+            $until = strtotime((string)$pref['mute_until']);
+            if ($until !== false && $until > time()) {
+                return false;
+            }
+        }
+        return true;
     };
 
     // Resume cursor from Last-Event-ID header or ?cursor=
@@ -94,54 +64,40 @@ if (($_GET['action'] ?? '') === 'connect') {
     $endAt   = time() + 110; // ~2 minutes per connection
     while (!connection_aborted() && time() < $endAt) {
         // Fetch new rows for this user since cursor
-        $st = $pdo->prepare("
-            SELECT
-              nr.id AS rid,
-              n.type, n.title, n.body, n.link, n.payload, n.created_at
-            FROM notification_recipients nr
-            JOIN notifications n ON n.id = nr.notification_id
-            WHERE nr.user_id = :u
-              AND nr.id > :cursor
-            ORDER BY nr.id ASC
-            LIMIT 50
-        ");
+        $st = $pdo->prepare(
+            'SELECT id, type, title, body, url, data AS payload, created_at '
+            . 'FROM notifications '
+            . 'WHERE user_id = :u AND id > :cursor '
+            . 'ORDER BY id ASC LIMIT 50'
+        );
         $st->execute([':u' => $userId, ':cursor' => $cursor]);
         $rows = $st->fetchAll(PDO::FETCH_ASSOC) ?: [];
 
-        $deliveredIds = [];
         foreach ($rows as $r) {
             $type = (string)$r['type'];
             if (!$shouldDeliver($userId, $type)) {
                 // Skip delivering, but don't advance cursor past it (so we reconsider later)
                 continue;
             }
-            $rid = (int)$r['rid'];
+            $rid = (int)$r['id'];
             $payload = [];
             if (!empty($r['payload'])) {
                 $dec = json_decode((string)$r['payload'], true);
                 if (is_array($dec)) $payload = $dec;
             }
+            $shouldPush = notif_type_allows_push($userId, $type);
             $data = [
                 'id'      => $rid,
                 'type'    => $type,
                 'title'   => (string)$r['title'],
                 'body'    => (string)$r['body'],
-                'link'    => (string)($r['link'] ?? ''),
+                'link'    => (string)($r['url'] ?? ''),
                 'created' => (string)$r['created_at'],
                 'payload' => $payload,
+                'should_push' => $shouldPush,
             ];
             $send('notify', $data, $rid);
             $cursor = $rid;
-            $deliveredIds[] = $rid;
-        }
-
-        // Mark delivered_at for those we actually sent
-        if ($deliveredIds) {
-            $in = implode(',', array_fill(0, count($deliveredIds), '?'));
-            $sql = "UPDATE notification_recipients SET delivered_at = NOW() WHERE id IN ($in) AND user_id = ?";
-            try {
-                $pdo->prepare($sql)->execute([...$deliveredIds, $userId]);
-            } catch (Throwable $e) {}
         }
 
         // Heartbeat (keeps proxies happy)

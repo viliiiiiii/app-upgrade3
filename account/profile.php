@@ -64,7 +64,7 @@ function fetch_user(PDO $pdo, int $id): ?array
 {
     $store = profile_resolve_user_store();
     if ($store['schema'] === 'core') {
-        $sql = 'SELECT u.id, u.email, u.pass_hash AS password_hash, u.role_id, u.created_at, '
+        $sql = 'SELECT u.id, u.email, u.notification_email, u.pass_hash AS password_hash, u.role_id, u.created_at, '
              . 'u.suspended_at, u.suspended_by, u.sector_id, '
              . 'r.label AS role_label, r.key_slug AS role_key, s.name AS sector_name '
              . 'FROM users u '
@@ -72,7 +72,7 @@ function fetch_user(PDO $pdo, int $id): ?array
              . 'LEFT JOIN sectors s ON s.id = u.sector_id '
              . 'WHERE u.id = ?';
     } else {
-        $sql = 'SELECT id, email, password_hash, role, created_at FROM users WHERE id = ?';
+        $sql = 'SELECT id, email, password_hash, role, created_at, NULL AS notification_email FROM users WHERE id = ?';
     }
 
     $st = $pdo->prepare($sql);
@@ -472,6 +472,7 @@ if (is_post()) {
 
         if ($action === 'change_email') {
             $newEmail = trim((string)($_POST['email'] ?? ''));
+            $notificationEmail = trim((string)($_POST['notification_email'] ?? ''));
             if ($newEmail === '') {
                 $errors[] = 'Email is required.';
             } elseif (!filter_var($newEmail, FILTER_VALIDATE_EMAIL)) {
@@ -488,22 +489,33 @@ if (is_post()) {
                 }
             }
 
+            if ($notificationEmail !== '' && !filter_var($notificationEmail, FILTER_VALIDATE_EMAIL)) {
+                $errors[] = 'Notification email must be a valid address or left blank.';
+            }
+
             if (!$errors) {
                 try {
                     $oldEmail = (string)$user['email'];
+                    $oldNotification = (string)($user['notification_email'] ?? '');
                     $columnEmail = 'email';
-                    $stmt = $pdo->prepare('UPDATE `users` SET `' . $columnEmail . '` = ? WHERE `id` = ?');
-                    $stmt->execute([$newEmail, $userId]);
+                    $stmt = $pdo->prepare('UPDATE `users` SET `' . $columnEmail . '` = ?, `notification_email` = ? WHERE `id` = ?');
+                    $stmt->execute([$newEmail, $notificationEmail !== '' ? $notificationEmail : null, $userId]);
 
                     profile_sync_shadow_email($userId, $newEmail, $storeSchema);
 
                     if (function_exists('log_event')) {
-                        log_event('user.email_change', 'user', $userId, ['old' => $oldEmail, 'new' => $newEmail]);
+                        log_event('user.email_change', 'user', $userId, [
+                            'old' => $oldEmail,
+                            'new' => $newEmail,
+                            'notification_old' => $oldNotification,
+                            'notification_new' => $notificationEmail,
+                        ]);
                     }
                     if (isset($_SESSION['user']) && is_array($_SESSION['user'])) {
                         $_SESSION['user']['email'] = $newEmail;
+                        $_SESSION['user']['notification_email'] = $notificationEmail;
                     }
-                    redirect_with_message('/account/profile.php', 'Email updated.', 'success');
+                    redirect_with_message('/account/profile.php', 'Email settings updated.', 'success');
                 } catch (Throwable $e) {
                     $errors[] = 'Failed to update email.';
                 }
@@ -519,10 +531,13 @@ if (is_post()) {
                 $errors[] = 'All password fields are required.';
             } elseif (!password_verify($current, (string)$user['password_hash'])) {
                 $errors[] = 'Your current password is incorrect.';
-            } elseif (strlen($new) < 8) {
-                $errors[] = 'New password must be at least 8 characters.';
-            } elseif ($new !== $confirm) {
-                $errors[] = 'New password and confirmation do not match.';
+            } else {
+                $pwError = password_strength_error($new);
+                if ($pwError !== null) {
+                    $errors[] = $pwError;
+                } elseif ($new !== $confirm) {
+                    $errors[] = 'New password and confirmation do not match.';
+                }
             }
 
             if (!$errors) {
@@ -734,12 +749,16 @@ include __DIR__ . '/../includes/header.php';
     <form method="post" class="profile-card card">
       <h2>Account</h2>
       <p class="section-subtitle">Update your sign-in email address.</p>
-      <label>Email
-        <input type="email" name="email" required value="<?php echo sanitize((string)$user['email']); ?>">
-      </label>
-      <label>Role
-        <input type="text" value="<?php echo sanitize($roleLabel ?: '—'); ?>" disabled>
-      </label>
+        <label>Email
+          <input type="email" name="email" required value="<?php echo sanitize((string)$user['email']); ?>">
+        </label>
+        <label>Notification email
+          <input type="email" name="notification_email" value="<?php echo sanitize((string)($user['notification_email'] ?? '')); ?>" placeholder="Optional address for alerts">
+          <span class="field-hint">Leave blank to use your sign-in email for notifications.</span>
+        </label>
+        <label>Role
+          <input type="text" value="<?php echo sanitize($roleLabel ?: '—'); ?>" disabled>
+        </label>
       <input type="hidden" name="action" value="change_email">
       <input type="hidden" name="<?php echo CSRF_TOKEN_NAME; ?>" value="<?php echo csrf_token(); ?>">
       <div class="form-actions">
