@@ -19,6 +19,14 @@ function sanitizeText(text) {
     .replace(/'/g, '&#39;');
 }
 
+function absoluteUrl(path) {
+  try {
+    return new URL(path, window.location.origin).href;
+  } catch (err) {
+    return path;
+  }
+}
+
 function formatRelativeTime(isoString) {
   if (!isoString) return '';
   const now = new Date();
@@ -129,6 +137,20 @@ function initNav() {
   }
 
   syncAria();
+}
+
+function initServiceWorker() {
+  if (!('serviceWorker' in navigator)) return;
+  const register = () => {
+    navigator.serviceWorker
+      .register('/sw.js', { scope: '/' })
+      .catch((err) => console.warn('Service worker registration failed', err));
+  };
+  if (document.readyState === 'complete') {
+    register();
+  } else {
+    window.addEventListener('load', register, { once: true });
+  }
 }
 
 async function fetchRoomsForBuilding(buildingId) {
@@ -323,6 +345,66 @@ function initNotifications() {
 
   const streamUrl = body.dataset.notifStream;
   const pollUrl = body.dataset.notifPoll;
+  const PROMPT_STORAGE_KEY = 'pwa-notif-permission';
+  const PROMPT_INTERVAL_MS = 1000 * 60 * 60 * 12; // 12 hours
+
+  const triggerSystemNotification = async (item) => {
+    if (!item || !item.should_push || !('Notification' in window) || !('serviceWorker' in navigator)) {
+      return;
+    }
+
+    if (Notification.permission === 'default') {
+      const now = Date.now();
+      const lastPrompt = Number(localStorage.getItem(PROMPT_STORAGE_KEY) || '0');
+      if (now - lastPrompt < PROMPT_INTERVAL_MS) {
+        return;
+      }
+      if (triggerSystemNotification.requested) {
+        return;
+      }
+      triggerSystemNotification.requested = true;
+      try {
+        const result = await Notification.requestPermission();
+        localStorage.setItem(PROMPT_STORAGE_KEY, String(Date.now()));
+        if (result !== 'granted') {
+          return;
+        }
+      } catch (err) {
+        localStorage.setItem(PROMPT_STORAGE_KEY, String(Date.now()));
+        return;
+      }
+    } else if (Notification.permission !== 'granted') {
+      return;
+    }
+
+    try {
+      const registration = await navigator.serviceWorker.getRegistration();
+      if (!registration) return;
+      const url = item.url ? absoluteUrl(item.url) : window.location.href;
+      const options = {
+        body: item.body || '',
+        data: { url },
+        tag: `notif-${item.id || Date.now()}`,
+        icon: '/assets/logo.png',
+        badge: '/assets/logo.png',
+        renotify: true,
+      };
+      if (registration.active) {
+        registration.active.postMessage({
+          type: 'show-notification',
+          payload: {
+            title: item.title || 'Notification',
+            options,
+          },
+        });
+      } else {
+        registration.showNotification(item.title || 'Notification', options);
+      }
+    } catch (err) {
+      console.warn('System notification failed', err);
+    }
+  };
+  triggerSystemNotification.requested = false;
 
   const renderCount = (count) => {
     const num = Number(count) || 0;
@@ -337,7 +419,12 @@ function initNotifications() {
   };
 
   const showToasts = (items = []) => {
-    items.forEach((item) => createToast(item));
+    items.forEach((item) => {
+      createToast(item);
+      if (item && item.should_push) {
+        triggerSystemNotification(item);
+      }
+    });
   };
 
   if (streamUrl && 'EventSource' in window) {
@@ -619,4 +706,5 @@ onReady(() => {
   initNotifications();
   initRooms();
   initCommandPalette();
+  initServiceWorker();
 });

@@ -6,6 +6,39 @@ $corePdo = get_pdo('core');
 $appsPdo = get_pdo();
 
 $errors = [];
+$permissions = permission_catalog();
+
+function normalize_permission_overrides(array $raw, array $catalog): array {
+    $normalized = [];
+    foreach ($catalog as $key => $_meta) {
+        $mode = isset($raw[$key]) ? strtolower((string)$raw[$key]) : 'inherit';
+        if (!in_array($mode, ['allow', 'deny'], true)) {
+            $mode = 'inherit';
+        }
+        $normalized[$key] = $mode;
+    }
+    return $normalized;
+}
+
+function save_permission_overrides(PDO $pdo, int $userId, array $overrides): void {
+    $deleteStmt = $pdo->prepare('DELETE FROM user_permissions WHERE user_id = :uid AND permission_key = :perm');
+    $upsertStmt = $pdo->prepare('INSERT INTO user_permissions (user_id, permission_key, granted) VALUES (:uid, :perm, :grant)
+        ON DUPLICATE KEY UPDATE granted = VALUES(granted)');
+
+    foreach ($overrides as $perm => $mode) {
+        if ($mode === 'inherit') {
+            $deleteStmt->execute([':uid' => $userId, ':perm' => $perm]);
+            continue;
+        }
+        $upsertStmt->execute([
+            ':uid'   => $userId,
+            ':perm'  => $perm,
+            ':grant' => $mode === 'allow' ? 1 : 0,
+        ]);
+    }
+
+    permission_invalidate_user_cache($userId);
+}
 
 $roles = $corePdo->query('SELECT id, key_slug, label FROM roles ORDER BY label')->fetchAll();
 $roleBySlug = [];
@@ -30,12 +63,18 @@ if (is_post()) {
             $roleSlug = (string)($_POST['role'] ?? 'viewer');
             $sectorInput = $_POST['sector'] ?? '';
             $sectorId = ($sectorInput === '' || $sectorInput === 'null') ? null : (int)$sectorInput;
+            $overrides = normalize_permission_overrides($_POST['perm_override'] ?? [], $permissions);
 
             if (!filter_var($email, FILTER_VALIDATE_EMAIL)) {
                 $errors[] = 'Valid email required.';
             }
             if ($password === '') {
                 $errors[] = 'Password required.';
+            } else {
+                $pwError = password_strength_error($password);
+                if ($pwError !== null) {
+                    $errors[] = $pwError;
+                }
             }
             if (!isset($roleBySlug[$roleSlug])) {
                 $errors[] = 'Invalid role selection.';
@@ -62,6 +101,7 @@ if (is_post()) {
                         ':pass_hash' => $hash,
                         ':role' => $roleSlug,
                     ]);
+                    save_permission_overrides($corePdo, $userId, $overrides);
                     log_event('user.create', 'user', $userId, ['role' => $roleSlug, 'sector_id' => $sectorId]);
                     redirect_with_message('users.php', 'User created.');
                 } catch (Throwable $e) {
@@ -78,6 +118,7 @@ if (is_post()) {
             $roleSlug = (string)($_POST['role'] ?? 'viewer');
             $sectorInput = $_POST['sector'] ?? '';
             $sectorId = ($sectorInput === '' || $sectorInput === 'null') ? null : (int)$sectorInput;
+            $overrides = normalize_permission_overrides($_POST['perm_override'] ?? [], $permissions);
 
             if ($userId <= 0) {
                 $errors[] = 'Invalid user.';
@@ -90,6 +131,12 @@ if (is_post()) {
             }
             if ($sectorId !== null && !isset($sectorById[$sectorId])) {
                 $errors[] = 'Invalid sector selection.';
+            }
+            if ($password !== '') {
+                $pwError = password_strength_error($password);
+                if ($pwError !== null) {
+                    $errors[] = $pwError;
+                }
             }
 
             if (!$errors) {
@@ -116,6 +163,7 @@ if (is_post()) {
                             ':pass_hash' => $hash,
                             ':role' => $roleSlug,
                         ]);
+                        save_permission_overrides($corePdo, $userId, $overrides);
                         log_event('user.update', 'user', $userId, ['role' => $roleSlug, 'sector_id' => $sectorId]);
                         redirect_with_message('users.php', 'User updated.');
                     }
@@ -173,6 +221,24 @@ $sql .= ' ORDER BY u.email';
 $stmt = $corePdo->prepare($sql);
 $stmt->execute($params);
 $users = $stmt->fetchAll();
+
+$userOverrides = [];
+if ($users) {
+    $ids = array_column($users, 'id');
+    if ($ids) {
+        $placeholders = implode(',', array_fill(0, count($ids), '?'));
+        $ovStmt = $corePdo->prepare('SELECT user_id, permission_key, granted FROM user_permissions WHERE user_id IN (' . $placeholders . ')');
+        $ovStmt->execute($ids);
+        foreach ($ovStmt->fetchAll(PDO::FETCH_ASSOC) as $row) {
+            $uid = (int)$row['user_id'];
+            $perm = (string)$row['permission_key'];
+            if (!isset($permissions[$perm])) {
+                continue;
+            }
+            $userOverrides[$uid][$perm] = !empty($row['granted']) ? 'allow' : 'deny';
+        }
+    }
+}
 
 $title = 'Manage Users';
 include __DIR__ . '/../includes/header.php';
@@ -254,6 +320,26 @@ include __DIR__ . '/../includes/header.php';
                 </select>
             </label>
 
+            <div class="field field-span-2">
+                <span class="lbl">Permission overrides</span>
+                <p class="muted small">Allow grants access beyond the role; Deny removes access even if the role normally allows it.</p>
+                <div class="perm-grid" style="display:grid; gap:8px;">
+                    <?php foreach ($permissions as $permKey => $meta): ?>
+                        <div class="perm-row" style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:6px 0; border-bottom:1px solid #f1f5f9;">
+                            <div class="perm-row__info" style="flex:1 1 auto;">
+                                <strong><?php echo sanitize($meta['label']); ?></strong>
+                                <div class="muted small"><?php echo sanitize($meta['description']); ?></div>
+                            </div>
+                            <select name="perm_override[<?php echo sanitize($permKey); ?>]" class="perm-row__select" style="min-width:160px;">
+                                <option value="inherit" selected>Inherit role</option>
+                                <option value="allow">Allow</option>
+                                <option value="deny">Deny</option>
+                            </select>
+                        </div>
+                    <?php endforeach; ?>
+                </div>
+            </div>
+
             <input type="hidden" name="action" value="create">
             <input type="hidden" name="<?php echo CSRF_TOKEN_NAME; ?>" value="<?php echo csrf_token(); ?>">
 
@@ -272,6 +358,7 @@ include __DIR__ . '/../includes/header.php';
                 <th>Email</th>
                 <th class="col-status">Role</th>
                 <th>Sector</th>
+                <th>Overrides</th>
                 <th class="col-status">Status</th>
                 <th class="col-actions">Actions</th>
             </tr>
@@ -287,6 +374,32 @@ include __DIR__ . '/../includes/header.php';
 
                 <td data-label="Sector">
                     <?php echo $user['sector_name'] ? sanitize($user['sector_name']) : '<em class="muted">Unassigned</em>'; ?>
+                </td>
+
+                <td data-label="Overrides">
+                    <?php
+                        $overrides = $userOverrides[$user['id']] ?? [];
+                        if (!$overrides) {
+                            echo '<span class="muted small">Inherited</span>';
+                        } else {
+                            $allow = [];
+                            $deny  = [];
+                            foreach ($overrides as $permKey => $mode) {
+                                $label = $permissions[$permKey]['label'] ?? $permKey;
+                                if ($mode === 'allow') {
+                                    $allow[] = $label;
+                                } elseif ($mode === 'deny') {
+                                    $deny[] = $label;
+                                }
+                            }
+                            if ($allow) {
+                                echo '<div><strong>Allow:</strong> ' . sanitize(implode(', ', $allow)) . '</div>';
+                            }
+                            if ($deny) {
+                                echo '<div><strong>Deny:</strong> ' . sanitize(implode(', ', $deny)) . '</div>';
+                            }
+                        }
+                    ?>
                 </td>
 
                 <td data-label="Status">
@@ -335,6 +448,28 @@ include __DIR__ . '/../includes/header.php';
                                     <span class="lbl">New Password</span>
                                     <input type="password" name="password" placeholder="Leave blank to keep current">
                                 </label>
+
+                                <div class="field field-span-2">
+                                    <span class="lbl">Permission overrides</span>
+                                    <p class="muted small">Override access just for this user.</p>
+                                    <div class="perm-grid" style="display:grid; gap:8px;">
+                                        <?php $currentOverrides = $userOverrides[$user['id']] ?? []; ?>
+                                        <?php foreach ($permissions as $permKey => $meta): ?>
+                                            <?php $selected = $currentOverrides[$permKey] ?? 'inherit'; ?>
+                                            <div class="perm-row" style="display:flex; align-items:flex-start; justify-content:space-between; gap:12px; padding:6px 0; border-bottom:1px solid #f1f5f9;">
+                                                <div class="perm-row__info" style="flex:1 1 auto;">
+                                                    <strong><?php echo sanitize($meta['label']); ?></strong>
+                                                    <div class="muted small"><?php echo sanitize($meta['description']); ?></div>
+                                                </div>
+                                                <select name="perm_override[<?php echo sanitize($permKey); ?>]" class="perm-row__select" style="min-width:160px;">
+                                                    <option value="inherit" <?php echo $selected === 'inherit' ? 'selected' : ''; ?>>Inherit role</option>
+                                                    <option value="allow" <?php echo $selected === 'allow' ? 'selected' : ''; ?>>Allow</option>
+                                                    <option value="deny" <?php echo $selected === 'deny' ? 'selected' : ''; ?>>Deny</option>
+                                                </select>
+                                            </div>
+                                        <?php endforeach; ?>
+                                    </div>
+                                </div>
 
                                 <input type="hidden" name="action" value="update">
                                 <input type="hidden" name="user_id" value="<?php echo (int)$user['id']; ?>">
